@@ -6,10 +6,29 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from intent_classification_xlm import *
 from sentence_transformers import SentenceTransformer, util
 from sklearn.cluster import KMeans
 from sklearn.manifold import TSNE
+
+
+# Preprocessing function to clean the tweets
+def preprocess_tweet(tweet):
+    tweet = tweet.lower()  # convert to lowercase
+    # remove handles, hashtags, urls
+    tweet = re.sub(r'@\w+', '', tweet)
+    tweet = re.sub(r'#\w+', '', tweet)
+
+    tweet = re.sub(r'http\S+', '', tweet)
+    tweet = re.sub(r'www\S+', '', tweet)
+    tweet = re.sub(r'pic.twitter\S+', '', tweet)
+
+    tweet = re.sub(r'\W', ' ', tweet) # remove special characters
+    tweet = re.sub(r'\s+', ' ', tweet) # remove multiple whitespaces
+
+    # tweet = remove_diacritics(tweet)
+
+    return tweet
+
 
 
 # Plot t-SNE visualization of the embedding matrix
