@@ -1,4 +1,5 @@
 
+import argparse
 import csv
 import json
 import re
@@ -6,14 +7,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from intent_classification_tfidf import remove_diacritics
 from sentence_transformers import SentenceTransformer, util
 from sklearn.cluster import KMeans
 from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score
+
+from bertopic import BERTopic
 
 
 # Preprocessing function to clean the tweets
 def preprocess_tweet(tweet):
-    tweet = tweet.lower()  # convert to lowercase
     # remove handles, hashtags, urls
     tweet = re.sub(r'@\w+', '', tweet)
     tweet = re.sub(r'#\w+', '', tweet)
@@ -32,9 +36,8 @@ def preprocess_tweet(tweet):
     return tweet
 
 
-
 # Plot t-SNE visualization of the embedding matrix
-def plot_tsne(embedding_matrix, labels):
+def plot_tsne(embedding_matrix, labels, model_tag):
     tsne = TSNE(n_components=2, perplexity=30, verbose=2)
     tsne_results = tsne.fit_transform(embedding_matrix)
 
@@ -42,58 +45,74 @@ def plot_tsne(embedding_matrix, labels):
     for i, label in enumerate(set(labels)):
         plt.scatter(tsne_results[labels == label, 0], tsne_results[labels == label, 1], label=label)
     plt.legend()
-    plt.savefig('tsne.png')
+    plt.savefig('tsne-{}.png'.format(model_tag))
 
 
 # Load tweets from json
-def load_tweets_from_json(json_file):
+def load_tweets_from_json(json_file, cased=False, preprocess=True):
     with open(json_file, 'r') as f:
         json_ = json.load(f)
 
-    tweets = [preprocess_tweet(tweet['full_text']) for tweet in json_]
+    tweets = []
+    for i, tweet_ in enumerate(json_):
+        tweet = tweet_['full_text']
+        if preprocess:
+            tweet = preprocess_tweet(tweet)
+        if not cased:
+            tweet = tweet.lower()  # convert to lowercase
+        tweets.append(tweet)
+
     return tweets
 
 
 def main():
-    # model_tag = 'all-distilroberta-v1'
-    model_tag = 'all-mpnet-base-v2 '
-    tweets = load_tweets_from_json('postgres_public_feeds_entry.json')
-    try:
-        # Load npz file from disk
-        file = np.load('tweet-embs-{}.npz'.format(model_tag))
-        tweet_embs = file.f.arr_0
-    except FileNotFoundError:
-        # Convert list of tweets into list of length-32 lists of tweets
-        batched_tweets = [tweets[i:i+32] for i in range(0, len(tweets), 32)]
+    # Add arguments for model tag and json filepath
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_tag', type=str, default='')
+    parser.add_argument('--json_file', type=str, default='postgres_public_feeds_entry.json')
+    parser.add_argument('--preprocess', action="store_true",
+                        help="Assume tweets are preprocessed if this flag is not set.")
+    args = parser.parse_args()
 
-        model = SentenceTransformer()
-        tweet_embs = []
-        # Compute intent embeddings
-        with torch.no_grad():
-            for batch in batched_tweets:
-                tweet_embs.append(model.encode(batch))
+    model_tag = args.model_tag
+    cased = True if 'cased' in model_tag else False
+    model = SentenceTransformer(model_tag) if model_tag else None
+    tweets = load_tweets_from_json(args.json_file, cased=cased, preprocess=args.preprocess)
+    tweets = list(set(tweets))
+    if args.preprocess:
+        # Save the preprocessed tweets to a json file in format "{"full_text": tweet}
+        # to be used in the intent classification script"
+        if cased:
+            out_json = 'postgres_public_feeds_entry_preprocessed_tr.json'
+        else:
+            out_json = 'postgres_public_feeds_entry_preprocessed_tr_lower.json'
+        with open(out_json, 'w') as f:
+            json.dump([{"full_text": tweet} for tweet in tweets], f)
 
-        tweet_embs = np.concatenate(tweet_embs, 0)
-        np.savez('tweet-embs-all-distilroberta-v1.npz', tweet_embs)
+    keywords = {
+        'kurtarma': 'enkaz altında yardım edin kurtarın bekliyor',
+        'ses': 'ses geliyor seslerini duyuyoruz ağlama sesleri geliyor',
+        'yemek_su': 'aç susuz yemek lazım gıda ihtiyacı var içme suyu eksik',
+        'giysi': 'battaniye çadır ve sıcak tutan giysiler gerekiyor çok soğuk',
+        'saglik': 'yaralılar var hastalara doktor ve ilaç lazım tedavi gerekli',
+        'siyaset': 'siyaset yapmanın sırası değil siyasetiniz batsın'
+    }
+    # Convert keywords to a list of lists by splitting on whitespace
+    for k, v in keywords.items():
+        keywords[k] = v.split(' ')
 
-    # Kmeans clustering on the embeddings
-    n_clusters = 6
-    kmeans = KMeans(n_clusters=n_clusters, random_state=0, max_iter=1000).fit(tweet_embs)
-    labels = kmeans.labels_
+    topic_model = BERTopic(
+        embedding_model=model,
+        language='multilingual',
+        seed_topic_list=list(keywords.values()),
+        n_gram_range=(1, 2),
+        min_topic_size=50,
+        nr_topics=50,
+        verbose=True)
+    topics, _ = topic_model.fit_transform(tweets)
 
-    # Separate the tweets into clusters
-    clusters = [[] for _ in range(n_clusters)]
-    for i, label in enumerate(labels):
-        clusters[label].append(tweets[i])
-
-    # Print 10 random tweets from each cluster
-    for i, cluster in enumerate(clusters):
-        print(f'\n\nCluster {i}:')
-        for tweet in np.random.choice(cluster, n_clusters):
-            print(tweet)
-
-    ids = np.random.choice(np.arange(len(tweet_embs)), 2000)
-    plot_tsne(tweet_embs[ids], labels[ids])
+    for k, v in topic_model.topic_sizes_.items():
+        print("{}: {}".format(v, topic_model.topic_labels_[k]))
 
     print()
 
