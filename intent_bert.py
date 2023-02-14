@@ -1,17 +1,15 @@
 
-import matplotlib.pyplot as plt
 import numpy as np
-import os
 import pandas as pd
+import random
 import torch as th
 
-from collections import Counter
-from datasets import load_dataset, load_metric
+from datasets import load_dataset
 from huggingface_hub import login
 from sklearn.metrics import classification_report, f1_score
 from sklearn.model_selection import train_test_split
 from unicode_tr import unicode_tr
-from transformers import (AdamW, AutoConfig, AutoTokenizer, AutoModelForSequenceClassification,
+from transformers import (AdamW, AutoTokenizer, AutoModelForSequenceClassification,
                           Trainer, TrainingArguments, EarlyStoppingCallback,
                           get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup)
 
@@ -19,6 +17,14 @@ LABEL_NAMES = [
     'Alakasiz', 'Barinma', 'Elektronik',
     'Giysi', 'Kurtarma', 'Lojistik', 'Saglik',
     'Su', 'Yagma', 'Yemek']
+
+
+def set_seed_everywhere(seed):
+    th.manual_seed(seed)
+    if th.cuda.is_available():
+        th.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
 
 def get_optimizer_grouped_parameters(
@@ -136,10 +142,11 @@ def select_thresholds(eval_labels, eval_probs):
     return thresholds
 
 
-def compute_f1(eval_pred):
+def compute_f1(eval_pred, thresholds=None):
     logits, labels = eval_pred
     probs = th.sigmoid(th.from_numpy(logits)).numpy()
-    thresholds = select_thresholds(labels, probs)
+    if thresholds is None:
+        thresholds = select_thresholds(labels, probs)
     predictions = (probs > thresholds).astype(int)
     return {"f1": f1_score(predictions, labels, average="macro")}
 
@@ -178,49 +185,57 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("dbmdz/bert-base-turkish-uncased")
     train_ds, val_ds, test_ds = prep_datasets(tokenizer)
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name, num_labels=len(LABEL_NAMES), problem_type="multi_label_classification")
+    f1s = []
+    for i in range(5):
+        set_seed_everywhere(i)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name, num_labels=len(LABEL_NAMES), problem_type="multi_label_classification")
 
-    training_args = TrainingArguments(
-        output_dir="./output-intent",
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        per_device_train_batch_size=32,
-        per_device_eval_batch_size=32,
-        # weight_decay=0.01,
-        report_to=None,
-        num_train_epochs=15,
-        metric_for_best_model="f1",
-        load_best_model_at_end=True,
-    )
+        training_args = TrainingArguments(
+            output_dir="./output-intent",
+            evaluation_strategy="epoch",
+            save_strategy="epoch",
+            per_device_train_batch_size=32,
+            per_device_eval_batch_size=32,
+            # weight_decay=0.01,
+            report_to=None,
+            num_train_epochs=15,
+            metric_for_best_model="f1",
+            load_best_model_at_end=True,
+        )
 
-    optimizer, scheduler = get_llrd_optimizer_scheduler(
-        model,
-        learning_rate=5e-5,
-        weight_decay=0.01,
-        layerwise_learning_rate_decay=0.8)
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        compute_metrics=compute_f1,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
-        optimizers=(optimizer, scheduler)
-    )
-    trainer.train()
+        optimizer, scheduler = get_llrd_optimizer_scheduler(
+            model,
+            learning_rate=5e-5,
+            weight_decay=0.01,
+            layerwise_learning_rate_decay=0.8)
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            compute_metrics=compute_f1,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+            optimizers=(optimizer, scheduler)
+        )
+        trainer.train()
 
-    val_preds = trainer.predict(val_ds)
-    thresholds = select_thresholds(val_preds.label_ids, val_preds.predictions)
+        train_preds = trainer.predict(train_ds)
+        val_preds = trainer.predict(val_ds)
+        thresholds = select_thresholds(
+            np.concatenate([train_preds.label_ids, val_preds.label_ids]),
+            np.concatenate([train_preds.predictions, val_preds.predictions])
+        )
+        test_preds = trainer.predict(test_ds)
+        f1 = compute_f1((test_preds.predictions, test_preds.label_ids), thresholds=thresholds)
+        f1s.append(f1["f1"])
+        report = classification_report(
+            test_preds.label_ids.astype(int),
+            (th.sigmoid(th.from_numpy(test_preds.predictions)).numpy() > thresholds).astype(int),
+            target_names=LABEL_NAMES, digits=3)
+        print(report)
 
-    test_preds = trainer.predict(test_ds)
-    report = classification_report(
-        test_preds.label_ids.astype(int),
-        (th.sigmoid(th.from_numpy(test_preds.predictions)).numpy() > thresholds).astype(int),
-        target_names=LABEL_NAMES)
-    print(report)
-
-    print()
+    print("Mean F1: {}, Std F1: {}".format(np.mean(f1s), np.std(f1s)))
 
 
 if __name__ == '__main__':
